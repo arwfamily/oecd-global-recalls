@@ -27,6 +27,17 @@ jobs:
       - name: Run Canada collector
         run: python collect_canada.py
 
+      - name: Run US collector
+        # Adapts tinysafe-data's published recalls_full.jsonl — never
+        # re-fetches CPSC/FDA/NHTSA, so there is exactly one US pipeline.
+        run: python collect_us.py
+
+      - name: Run EU collector
+        # Safety Gate weekly-report XML. Walks report ids with a per-run
+        # budget; the same walk is the daily sync and the 2005+ backfill,
+        # resuming from eu_state.json every run.
+        run: python collect_eu.py
+
       - name: Commit results
         run: |
           git config user.name "oecd-collector-bot"
