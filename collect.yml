@@ -1,0 +1,40 @@
+name: Collect OECD GlobalRecalls feed
+
+on:
+  schedule:
+    # Feed TTL is 1440 min (daily). Run twice a day so one failed run
+    # never costs us a day of a 7-day rolling window.
+    - cron: "23 5 * * *"
+    - cron: "23 17 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run OECD collector
+        run: python collect_oecd.py
+
+      - name: Run Canada collector
+        run: python collect_canada.py
+
+      - name: Commit results
+        run: |
+          git config user.name "oecd-collector-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes today."
+          else
+            git commit -m "collect: $(date -u +%Y-%m-%d) feed snapshot"
+            git push
+          fi
