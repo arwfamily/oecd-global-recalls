@@ -21,8 +21,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run collector
+      - name: Run OECD collector
         run: python collect_oecd.py
+
+      - name: Run Canada collector
+        run: python collect_canada.py
 
       - name: Commit results
         run: |
@@ -35,3 +38,4 @@ jobs:
             git commit -m "collect: $(date -u +%Y-%m-%d) feed snapshot"
             git push
           fi
+
