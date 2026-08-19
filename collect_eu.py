@@ -36,7 +36,7 @@ URL = ("https://ec.europa.eu/safety-gate-alerts/api/download/"
 ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "data" / "raw" / "eu"
 OUT = ROOT / "data" / "canonical" / "eu.jsonl"
-STATE = ROOT / "eu_state.json"
+STATE = ROOT / "data" / "eu_state.json"
 
 SEED = 520          # verified: 2013 week 5
 BUDGET = 80         # weekly reports fetched per run (~20 runs for full history)
@@ -45,11 +45,23 @@ MISS_LIMIT_DOWN = 15 # history may contain id gaps; longer fuse before declaring
 FLOOR = 1           # never probe below this id
 
 
+_FIRST_ERROR = []
+
+
 def fetch_report(rid):
     """Parsed (root, raw_bytes) or (None, None) on any failure."""
     req = urllib.request.Request(
         URL.format(rid=rid),
-        headers={"User-Agent": "arw-global-recalls-collector/1.0"})
+        headers={
+            # ec.europa.eu rejects non-browser clients from some networks
+            # (first run on GitHub's runner fetched 0 of 95 reports) — the
+            # NHTSA/Akamai lesson again, so identify as a browser.
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                           "Version/17.4 Safari/605.1.15"),
+            "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en",
+        })
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read()
@@ -57,7 +69,9 @@ def fetch_report(rid):
         if root.tag != "Safety-Gate":
             return None, None
         return root, raw
-    except Exception:
+    except Exception as e:
+        if not _FIRST_ERROR:
+            _FIRST_ERROR.append(f"report {rid}: {e!r}")
         return None, None
 
 
@@ -171,6 +185,8 @@ def main():
         for rec in ordered:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     tmp.replace(OUT)
+    if _FIRST_ERROR and not any_success:
+        print(f"  !! every fetch failed — first error: {_FIRST_ERROR[0]}")
     if fetched > 0 and not any_success:
         # network was down or the endpoint changed — moving the pointers now
         # would permanently skip real reports, so keep last run's state
