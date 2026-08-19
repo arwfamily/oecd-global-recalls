@@ -30,8 +30,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from adapters.eu import to_canonical  # noqa: E402
 
+# The `search` parameter is REQUIRED — the server answers 400 without it.
+# This is exactly the URL shape verified live (report 520); it was "simplified"
+# once by dropping search= and the runner got 400 on every request. Never
+# simplify a verified URL without re-verifying the simplification.
 URL = ("https://ec.europa.eu/safety-gate-alerts/api/download/"
-       "weeklyReport/detail/xml/{rid}?language=en")
+       "weeklyReport/detail/xml/{rid}"
+       "?language=en&search=WEB_REPORT%7C:%7C{rid}")
 
 ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "data" / "raw" / "eu"
