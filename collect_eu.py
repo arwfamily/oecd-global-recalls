@@ -43,11 +43,22 @@ RAW_DIR = ROOT / "data" / "raw" / "eu"
 OUT = ROOT / "data" / "canonical" / "eu.jsonl"
 STATE = ROOT / "data" / "eu_state.json"
 
-SEED = 520          # verified: 2013 week 5
-BUDGET = 80         # weekly reports fetched per run (~20 runs for full history)
-MISS_LIMIT = 8       # consecutive misses that stop the upward probe this run
-MISS_LIMIT_DOWN = 15 # history may contain id gaps; longer fuse before declaring done
-FLOOR = 1           # never probe below this id
+# The report-id space has TWO segments (found by hitting the wall between
+# them: ids 541-548 all miss while 469-540 and 10000012 exist):
+#   legacy  ~1..~540      old RAPEX portal, verified 520 = 2013 week 5
+#   modern  10000001..    relaunched portal, verified 10000012 = 2020-09-18
+# Each segment is walked independently; priority per run is modern-up (this
+# week's report), modern-down, legacy-down (2005-2012 history), legacy-up
+# (hole-hunting past 540, bounded so it can never wander toward 10M).
+SEGMENTS = {
+    "modern": {"seed": 10000012, "floor": 10000001, "ceiling": None,
+               "miss_up": 8, "miss_down": 15},
+    "legacy": {"seed": 520, "floor": 1, "ceiling": 2000,
+               "miss_up": 25, "miss_down": 15},
+}
+WALK_ORDER = [("modern", "up"), ("modern", "down"),
+              ("legacy", "down"), ("legacy", "up")]
+BUDGET = 80         # weekly reports fetched per run
 
 
 _FIRST_ERROR = []
@@ -94,10 +105,21 @@ def load_existing():
 
 def load_state():
     try:
-        return json.loads(STATE.read_text())
+        s = json.loads(STATE.read_text())
     except Exception:
-        # low/high = the CONTIGUOUS done-range; everything outside is未走
-        return {"low": SEED, "high": SEED - 1, "low_done": False, "high_done": False}
+        s = {}
+    if "segments" not in s:
+        segs = {}
+        for name, cfg in SEGMENTS.items():
+            segs[name] = {"low": cfg["seed"], "high": cfg["seed"] - 1,
+                          "low_done": False, "high_done": False}
+        # migrate a v1 state file (single legacy walk) if one exists
+        if "low" in s:
+            segs["legacy"] = {"low": s["low"], "high": s["high"],
+                              "low_done": s.get("low_done", False),
+                              "high_done": False}
+        s = {"segments": segs}
+    return s
 
 
 def ingest(root, rid, existing, today):
@@ -135,34 +157,23 @@ def main():
     fetched = added = updated = 0
     any_success = False
 
-    # 1) upward first — new Friday reports beat old history
-    misses = 0
-    rid = state["high"] + 1
-    while budget > 0 and misses < MISS_LIMIT:
-        root, raw = fetch_report(rid)
-        budget -= 1
-        fetched += 1
-        if root is None:
-            misses += 1
-        else:
-            misses = 0
-            any_success = True
-            a, u = ingest(root, rid, existing, today)
-            added += a
-            updated += u
-            RAW_DIR.mkdir(parents=True, exist_ok=True)
-            with gzip.open(RAW_DIR / f"report_{rid}.xml.gz", "wb") as f:
-                f.write(raw)
-            state["high"] = rid
-        rid += 1
-    # misses at the top are expected (this week's report may not exist yet);
-    # they never mark the upward direction done.
-
-    # 2) downward into history
-    if not state.get("low_done"):
+    def walk(seg_name, direction):
+        nonlocal budget, fetched, added, updated, any_success
+        cfg = SEGMENTS[seg_name]
+        seg = state["segments"][seg_name]
+        if direction == "down" and seg.get("low_done"):
+            return
+        if direction == "up" and seg.get("high_done"):
+            return
         misses = 0
-        rid = state["low"] - 1
-        while budget > 0 and misses < MISS_LIMIT_DOWN and rid >= FLOOR:
+        fuse = cfg["miss_up"] if direction == "up" else cfg["miss_down"]
+        rid = seg["high"] + 1 if direction == "up" else seg["low"] - 1
+        while budget > 0 and misses < fuse:
+            if direction == "down" and rid < cfg["floor"]:
+                seg["low_done"] = True
+                return
+            if direction == "up" and cfg["ceiling"] and rid > cfg["ceiling"]:
+                return
             root, raw = fetch_report(rid)
             budget -= 1
             fetched += 1
@@ -170,16 +181,30 @@ def main():
                 misses += 1
             else:
                 misses = 0
+                any_success = True
                 a, u = ingest(root, rid, existing, today)
                 added += a
                 updated += u
                 RAW_DIR.mkdir(parents=True, exist_ok=True)
                 with gzip.open(RAW_DIR / f"report_{rid}.xml.gz", "wb") as f:
                     f.write(raw)
-            state["low"] = rid
-            rid -= 1
-        if misses >= MISS_LIMIT_DOWN or rid < FLOOR:
-            state["low_done"] = True
+                if direction == "up":
+                    seg["high"] = rid
+            if direction == "down":
+                seg["low"] = rid
+                rid -= 1
+            else:
+                rid += 1
+        if direction == "down" and misses >= fuse:
+            seg["low_done"] = True
+        # A bounded segment (legacy) is historical: fuse blown upward = top
+        # found, close it. An unbounded segment (modern) never closes upward —
+        # this week's report simply may not exist yet.
+        if direction == "up" and cfg["ceiling"] and (misses >= fuse or rid > cfg["ceiling"]):
+            seg["high_done"] = True
+
+    for seg_name, direction in WALK_ORDER:
+        walk(seg_name, direction)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(existing.values(),
@@ -206,9 +231,11 @@ def main():
         by_country[rec["authority"]] = by_country.get(rec["authority"], 0) + 1
         for h in rec["hazards"]:
             by_risk[h] = by_risk.get(h, 0) + 1
+    rng = " | ".join(
+        f"{k} {v['low']}..{v['high']}{' done' if v.get('low_done') else ''}"
+        for k, v in state["segments"].items())
     print(f"[collect_eu] {today}: {before} -> {n} (+{added}, ~{updated}); "
-          f"{fetched} reports fetched, range {state['low']}..{state['high']}, "
-          f"backfill {'DONE' if state.get('low_done') else 'in progress'}")
+          f"{fetched} reports fetched; {rng}")
     print("  by type:", dict(sorted(by_type.items(), key=lambda kv: -kv[1])))
     print("  top notifying countries:",
           dict(sorted(by_country.items(), key=lambda kv: -kv[1])[:8]))
@@ -218,3 +245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
