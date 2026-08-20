@@ -23,10 +23,19 @@ import hashlib
 import re
 
 UID_PATTERNS = [
+    # Real markup observed 2026-08-19 in the mirror's list HTML:
+    #   <a href="#" onclick="viewDtail(10022792)">저속전동이륜차</a>
+    # and 10022792 is EXACTLY the safetykorea recallUid — verified equal to
+    # the numeric part of OECD KR native_id K26/EP/10022792 (same product,
+    # same date). One id family across mirror, safetykorea, and OECD.
+    re.compile(r"viewDtail\s*\(\s*['\"]?(\d+)"),
     re.compile(r"recallUid=(\d+)"),
     re.compile(r"fn\w*View\w*\(\s*['\"]?(\d+)"),
     re.compile(r"NR_view\.do[^\"']*[?&](?:uid|seq|idx|recallUid|boardSeq)=(\d+)"),
     re.compile(r"data-(?:uid|seq|id)=[\"'](\d+)"),
+    # last resort: any onclick handler whose first argument is a long number
+    # (uids are 8 digits; page numbers are short, so require 6+)
+    re.compile(r"onclick=\"[A-Za-z_$][\w$]*\(\s*['\"]?(\d{6,})"),
 ]
 
 ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
