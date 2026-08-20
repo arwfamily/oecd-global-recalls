@@ -73,27 +73,54 @@ import urllib.request
 from pathlib import Path
 
 def git_checkpoint(label: str):
-    """Commit+push data/ after a completed window. Never crashes the run."""
+    """Commit+push data/ after a completed window. Never crashes the run.
+
+    v3 (2026-08-20): the first checkpointed run committed 2000-2011 fine and
+    then died at 2012 — the daily collect job had pushed in the meantime, our
+    push was rejected, and the recovery `git pull --rebase` could not work
+    because actions/checkout clones SHALLOW by default (fetch-depth 1): there
+    is no history to rebase onto. So we unshallow once, rebase explicitly
+    onto origin/HEAD, and log git's own stderr when something still fails.
+    """
     if not os.environ.get("GITHUB_ACTIONS"):
         return  # local runs: filesystem persistence is enough
     import subprocess
+
     def sh(*cmd):
-        return subprocess.run(cmd, capture_output=True, text=True).returncode
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        return p.returncode, (p.stderr or p.stdout).strip()
+
     sh("git", "config", "user.name", "oecd-collector-bot")
     sh("git", "config", "user.email", "actions@users.noreply.github.com")
     sh("git", "add", "data/")
-    if sh("git", "diff", "--cached", "--quiet") == 0:
+    if sh("git", "diff", "--cached", "--quiet")[0] == 0:
         return  # nothing new
-    if sh("git", "commit", "-m", f"backfill checkpoint: {label}") != 0:
-        print(f"  [!] checkpoint {label}: commit failed", file=sys.stderr)
+    rc, err = sh("git", "commit", "-m", f"backfill checkpoint: {label}")
+    if rc != 0:
+        print(f"  [!] checkpoint {label}: commit failed: {err[:200]}",
+              file=sys.stderr)
         return
-    for _ in range(3):
-        if sh("git", "push") == 0:
-            print(f"  [*] checkpoint {label}: committed & pushed")
+    for attempt in range(4):
+        rc, err = sh("git", "push")
+        if rc == 0:
+            print(f"  [*] checkpoint {label}: pushed")
             return
-        sh("git", "pull", "--rebase")
-    print(f"  [!] checkpoint {label}: push failed after retries "
-          f"(kept locally; final workflow commit step is the safety net)",
+        # Someone else (the daily collect job) pushed first. Deepen the clone
+        # if needed, replay our commit on top of theirs, and try again.
+        if attempt == 0:
+            sh("git", "fetch", "--unshallow")
+        sh("git", "fetch", "origin")
+        rc2, err2 = sh("git", "rebase", "origin/HEAD")
+        if rc2 != 0:
+            sh("git", "rebase", "--abort")
+            rc2, err2 = sh("git", "pull", "--rebase", "--autostash")
+        if rc2 != 0:
+            print(f"  [!] checkpoint {label}: rebase failed: {err2[:200]}",
+                  file=sys.stderr)
+        time.sleep(3)
+    print(f"  [!] checkpoint {label}: push failed after retries: {err[:200]} "
+          f"(work is committed locally; the workflow's final commit step "
+          f"retries too, and the next dispatch resumes from the state file)",
           file=sys.stderr)
 
 
