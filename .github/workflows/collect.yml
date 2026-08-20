@@ -40,9 +40,17 @@ jobs:
 
       - name: Run KR collector
         # Seoul mirror of safetykorea (제품안전정보센터) — zero-auth GET
-        # pagination, ~124 pages, walks the full 3-year window every run;
-        # the canonical store only grows, so history accrues from today.
+        # pagination, walks the displayed 3-year window every run; the
+        # canonical store only grows, so history accrues from today.
+        env:
+          PYTHONUNBUFFERED: "1"
         run: python collect_kr_seoul.py
+
+      - name: Build baby view
+        # Derives data/views/baby.jsonl from every canonical store.
+        # The view is disposable output rebuilt from scratch each run;
+        # the canonicals are the asset. Rules live in build_baby_view.py.
+        run: python build_baby_view.py
 
       - name: Commit results
         run: |
@@ -55,4 +63,27 @@ jobs:
             git commit -m "collect: $(date -u +%Y-%m-%d) feed snapshot"
             git push
           fi
+
+  backfill-oecd:
+    # Manual one-shot: Actions 탭 → Run workflow 로만 실행됨.
+    # 2000년~ 전체 OECD 레지스트리 백필 (연도별 체크포인트, 재실행 안전).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Backfill OECD registry (2000 -> today)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python backfill_oecd.py
+      - name: Commit
+        run: |
+          git config user.name "oecd-collector-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "backfill: OECD registry"
+          git push
 
