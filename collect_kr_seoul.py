@@ -1,19 +1,27 @@
 """
-KR collector — walk the Seoul mirror's domestic recall list.
+KR collector v2 — walk the Seoul mirror's domestic recall list.
 
-Zero-auth door into Korean (safetykorea-origin) recalls. GET pagination,
-browser-like headers (EU lesson: gov endpoints reject bare clients),
-polite 0.5 s sleep, raw HTML snapshots kept under data/raw/kr_seoul/ (L0),
-merged output at data/canonical/kr.jsonl keyed by record id.
+v1 run findings (2026-08-19, live):
+- 760/1,240 collected, then page 78 returned no data rows and the walk
+  concluded "end of data". 77 rapid cookieless requests then emptiness
+  smells like session/rate handling, not the end of the list.
+- last-page detection via the '마지막' anchor failed (last_page=400 fuse);
+  the '전체 1240 건(1/124 page)' text is the sturdier source.
+- No uids in the list HTML — identity stays natural-key until the
+  safetykorea Open API supplies real recallUids.
 
-The mirror holds ~3 years only, so every run walks ALL pages of the
-domestic list (~124 pages ≈ 1 minute) — new records join, known records
-refresh, and disappearance from the mirror does NOT delete anything
-(the canonical store only grows).
-
-The run log reports how many records carried a real safetykorea uid vs a
-natural key — read that line on the first run: it decides whether the
-safetykorea Open API is needed for identity or only for backfill.
+v2 therefore:
+1. keeps the JSESSIONID cookie from the first response and replays it
+   (eGov sites often demand a live session for deeper pages);
+2. reads last_page from '(x/y page)';
+3. treats an empty page BEFORE the expected last page as an anomaly:
+   waits, retries twice with backoff, snapshots the raw HTML to
+   data/raw/kr_seoul/ (L0) so the next session can see what the server
+   actually said, and only then skips that page — never silently
+   concluding the walk early;
+4. slows to 1.2 s between pages;
+5. prints the first data row's raw <tr> once per run (truncated) so we
+   can inspect the real anchor markup for uid patterns.
 """
 
 import datetime
@@ -35,22 +43,32 @@ HEADERS = {
 }
 OUT = Path(__file__).parent / "data" / "canonical" / "kr.jsonl"
 RAW_DIR = Path(__file__).parent / "data" / "raw" / "kr_seoul"
-SLEEP = 0.5
-MAX_PAGES = 400          # fuse; the site reports ~124 today
-LAST_PAGE_RE = re.compile(r"pageIndex=(\d+)[^>]*>\s*(?:마지막|Last)", re.I)
+SLEEP = 1.2
+MAX_PAGES = 400                     # absolute fuse
+PAGES_RE = re.compile(r"\(\s*\d+\s*/\s*(\d+)\s*page\s*\)")
 TOTAL_RE = re.compile(r"전체\s*([\d,]+)\s*건")
+ROW_SNIPPET_RE = re.compile(r"<tr[^>]*>\s*<td[^>]*>\s*\d+\s*</td>.*?</tr>", re.S)
+
+_cookie = {"v": ""}
 
 
 def fetch(page: int, tries: int = 3) -> str:
     url = f"{BASE}?pageIndex={page}"
     for attempt in range(tries):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
+            headers = dict(HEADERS)
+            if _cookie["v"]:
+                headers["Cookie"] = _cookie["v"]
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=40) as r:
+                sc = r.headers.get("Set-Cookie")
+                if sc and "JSESSIONID" in sc and not _cookie["v"]:
+                    _cookie["v"] = sc.split(";", 1)[0]
+                    print(f"[*] session cookie captured")
                 return r.read().decode("utf-8", errors="replace")
         except Exception as e:  # noqa: BLE001
             print(f"  [!] page {page} attempt {attempt + 1}: {e}", file=sys.stderr)
-            time.sleep(2 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
     return ""
 
 
@@ -70,25 +88,47 @@ def main():
     first = fetch(1)
     if not first:
         sys.exit("[!] page 1 unreachable — aborting without touching the store")
-    m = TOTAL_RE.search(first)
-    lp = LAST_PAGE_RE.search(first)
-    last_page = min(int(lp.group(1)) if lp else MAX_PAGES, MAX_PAGES)
-    print(f"[*] mirror reports total={m.group(1) if m else '?'} "
-          f"last_page={last_page}")
-    (RAW_DIR / f"list_p1_{today}.html").write_text(first)  # L0 snapshot
+    total = TOTAL_RE.search(first)
+    pages = PAGES_RE.search(first)
+    last_page = min(int(pages.group(1)) if pages else MAX_PAGES, MAX_PAGES)
+    print(f"[*] mirror reports total={total.group(1) if total else '?'} "
+          f"last_page={last_page}"
+          f"{'' if pages else '  (page-count text not found — fuse in effect)'}")
+    (RAW_DIR / f"list_p1_{today}.html").write_text(first)
 
-    new = refreshed = uid_count = nk_count = 0
+    snip = ROW_SNIPPET_RE.search(first)
+    if snip:
+        print(f"[*] raw first data row (for uid inspection):\n"
+              f"    {snip.group(0)[:500]}")
+
+    new = refreshed = uid_count = nk_count = anomalies = 0
     page = 1
     while page <= last_page:
         html = first if page == 1 else fetch(page)
-        if not html:
-            print(f"  [!] page {page} failed after retries — continuing")
-            page += 1
-            continue
-        rows = parse_list_page(html, "domestic")
-        if not rows and page > 1:
-            print(f"  [*] page {page}: no data rows — stopping walk")
-            break
+        rows = parse_list_page(html, "domestic") if html else []
+        if not rows and page < last_page:
+            # Empty before the promised end = anomaly, not end-of-data.
+            anomalies += 1
+            (RAW_DIR / f"anomaly_p{page}_{today}.html").write_text(html or "")
+            stripped = re.sub(r"<[^>]+>", " ", html or "")
+            stripped = re.sub(r"\s+", " ", stripped).strip()
+            print(f"  [!] page {page}: 0 data rows before expected end — "
+                  f"server said: {stripped[:160]!r}")
+            recovered = False
+            for wait in (8, 25):
+                time.sleep(wait)
+                html = fetch(page)
+                rows = parse_list_page(html, "domestic") if html else []
+                if rows:
+                    print(f"  [*] page {page}: recovered after {wait}s backoff")
+                    recovered = True
+                    break
+            if not recovered:
+                print(f"  [!] page {page}: still empty after backoff — "
+                      f"skipping (snapshot kept); walk continues")
+                page += 1
+                time.sleep(SLEEP)
+                continue
         for rec in rows:
             uid_count += rec["id_scheme"] == "safetykorea_uid"
             nk_count += rec["id_scheme"] == "natural_key"
@@ -110,12 +150,13 @@ def main():
         for r in rows_sorted:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     tmp.replace(OUT)
-    print(f"[*] done: +{new} new, {refreshed} refreshed, store={len(store)}")
-    print(f"[*] identity: safetykorea_uid={uid_count} natural_key={nk_count}"
-          f"{'  <- uid extraction worked!' if uid_count else ''}")
-    if uid_count == 0 and (new or refreshed):
-        print("[*] no uids exposed in list HTML — identity is natural-key for "
-              "now; the safetykorea Open API upgrade will supply real uids")
+    print(f"[*] done: +{new} new, {refreshed} refreshed, "
+          f"anomalous_pages={anomalies}, store={len(store)}")
+    print(f"[*] identity: safetykorea_uid={uid_count} natural_key={nk_count}")
+    exp = int(total.group(1).replace(",", "")) if total else None
+    if exp and len(store) < exp:
+        print(f"[*] store {len(store)} < mirror total {exp} — "
+              f"re-run to fill remaining pages (walk resumes cheaply)")
 
 
 if __name__ == "__main__":
