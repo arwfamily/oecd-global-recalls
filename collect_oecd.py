@@ -110,6 +110,9 @@ def load_existing() -> dict:
     return records
 
 
+ENRICHED_FIELDS = ("ext_url", "image_url", "tags", "made_in", "collected_via")
+
+
 def merge(existing: dict, incoming, today: str):
     added = updated = 0
     for rec in incoming:
@@ -120,6 +123,14 @@ def merge(existing: dict, incoming, today: str):
             added += 1
         else:
             old = existing[key]
+            # The backfill (backfill_oecd.py) enriches records with fields
+            # the RSS feed never carries — ext_url, taxonomy tags, made_in.
+            # Any replacement below must inherit them, or an RSS refresh
+            # (FR->EN upgrade, amended text) silently strips a record back
+            # down to feed-thin.
+            for k in ENRICHED_FIELDS:
+                if old.get(k) and not rec.get(k):
+                    rec[k] = old[k]
             # Same recall seen again. Upgrade FR -> EN; otherwise refresh
             # text fields in case the source amended them. Keep first_seen.
             if old.get("lang") != "EN" and rec["lang"] == "EN":
