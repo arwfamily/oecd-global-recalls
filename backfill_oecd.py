@@ -49,6 +49,15 @@ Strategy
 Run:  python backfill_oecd.py            # full 2000..today
       python backfill_oecd.py 2019 2022  # just those years (resume/repair)
 
+v2 (2026-08-20): the first live run proved the checkpoint design half-built.
+Every completed year was saved — to the runner's disk, where the 120-minute
+timeout took it to the grave: the workflow's commit step never ran, and
+~40k collected records evaporated. In Actions, persistence means COMMIT.
+So the collector now commits and pushes after every completed year window
+(with a pull --rebase retry so it coexists with concurrent daily runs).
+A timeout can no longer lose more than the year in progress, and the next
+dispatch resumes from the committed state file.
+
 Politeness: 0.4 s between requests, 3 retries with backoff, custom UA.
 State: data/backfill_state.json marks completed windows so a re-run skips
 them; delete a year from it (or the file) to force re-collection.
@@ -56,11 +65,37 @@ them; delete a year from it (or the file) to force re-collection.
 
 import datetime
 import json
+import os
 import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+def git_checkpoint(label: str):
+    """Commit+push data/ after a completed window. Never crashes the run."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return  # local runs: filesystem persistence is enough
+    import subprocess
+    def sh(*cmd):
+        return subprocess.run(cmd, capture_output=True, text=True).returncode
+    sh("git", "config", "user.name", "oecd-collector-bot")
+    sh("git", "config", "user.email", "actions@users.noreply.github.com")
+    sh("git", "add", "data/")
+    if sh("git", "diff", "--cached", "--quiet") == 0:
+        return  # nothing new
+    if sh("git", "commit", "-m", f"backfill checkpoint: {label}") != 0:
+        print(f"  [!] checkpoint {label}: commit failed", file=sys.stderr)
+        return
+    for _ in range(3):
+        if sh("git", "push") == 0:
+            print(f"  [*] checkpoint {label}: committed & pushed")
+            return
+        sh("git", "pull", "--rebase")
+    print(f"  [!] checkpoint {label}: push failed after retries "
+          f"(kept locally; final workflow commit step is the safety net)",
+          file=sys.stderr)
+
 
 BASE = "https://globalrecalls.oecd.org/ws/search.xqy"
 UA = "TinySafe-GlobalRecalls/1.0 (baby product safety; contact: arwfamily)"
@@ -284,11 +319,20 @@ def main():
         state[wkey] = "done"
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(state, indent=1))
-        save(records)  # checkpoint after every year — a crash loses nothing
+        save(records)
+        git_checkpoint(str(year))  # in Actions, persistence means commit
 
     print(f"\n[*] backfill done: +{grand['new']} new, "
           f"{grand['enriched']} enriched, {grand['dup']} already known")
     print(f"[*] store now: {len(records)} records -> {OUT_PATH}")
+    hist = {}
+    for r in records.values():
+        hist[(r.get("date_submitted") or "????")[:4]] = \
+            hist.get((r.get("date_submitted") or "????")[:4], 0) + 1
+    print("[*] year histogram (self-audit — compare against per-window "
+          "totals above):")
+    for y in sorted(hist):
+        print(f"    {y}: {hist[y]}")
 
 
 if __name__ == "__main__":
