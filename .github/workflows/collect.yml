@@ -69,7 +69,7 @@ jobs:
     # 2000년~ 전체 OECD 레지스트리 백필 (연도별 체크포인트, 재실행 안전).
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
