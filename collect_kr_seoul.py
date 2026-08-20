@@ -29,6 +29,8 @@ import json
 import re
 import sys
 import time
+
+sys.stdout.reconfigure(line_buffering=True)  # live logs in Actions
 import urllib.request
 from pathlib import Path
 
@@ -101,38 +103,58 @@ def main():
         print(f"[*] raw first data row (for uid inspection):\n"
               f"    {snip.group(0)[:500]}")
 
-    new = refreshed = uid_count = nk_count = anomalies = 0
+    # Migration index: natural-key records from the pre-uid era get
+    # superseded in place the moment the same row arrives carrying a real
+    # safetykorea uid — first_seen is carried over, the nk id retires.
+    nk_index = {}
+    for rid, r in store.items():
+        if r.get("id_scheme") == "natural_key":
+            nk = (r.get("date_published"), r.get("product_name"),
+                  r.get("model"), r.get("company"))
+            nk_index[nk] = rid
+
+    new = refreshed = uid_count = nk_count = migrated = 0
+    consecutive_empty = 0
     page = 1
     while page <= last_page:
         html = first if page == 1 else fetch(page)
         rows = parse_list_page(html, "domestic") if html else []
         if not rows and page < last_page:
-            # Empty before the promised end = anomaly, not end-of-data.
-            anomalies += 1
-            (RAW_DIR / f"anomaly_p{page}_{today}.html").write_text(html or "")
-            stripped = re.sub(r"<[^>]+>", " ", html or "")
-            stripped = re.sub(r"\s+", " ", stripped).strip()
-            print(f"  [!] page {page}: 0 data rows before expected end — "
-                  f"server said: {stripped[:160]!r}")
-            recovered = False
-            for wait in (8, 25):
-                time.sleep(wait)
-                html = fetch(page)
-                rows = parse_list_page(html, "domestic") if html else []
-                if rows:
-                    print(f"  [*] page {page}: recovered after {wait}s backoff")
-                    recovered = True
+            # v1/v2 lesson (2026-08-19): the site's '전체 N 건' counter is
+            # STALE — it counts purged rows too. The displayed window ended
+            # at page 77 while the counter promised 124. One quick retry
+            # guards against a transient blank; a second consecutive empty
+            # page means the display window is over. That is data-end, not
+            # an anomaly — stop cleanly instead of grinding backoffs.
+            time.sleep(4)
+            html = fetch(page)
+            rows = parse_list_page(html, "domestic") if html else []
+            if not rows:
+                consecutive_empty += 1
+                if consecutive_empty == 1:
+                    (RAW_DIR / f"window_end_p{page}_{today}.html").write_text(html or "")
+                if consecutive_empty >= 2:
+                    print(f"  [*] pages {page - 1}-{page} empty — display "
+                          f"window ends here (site total counter is stale); "
+                          f"stopping walk")
                     break
-            if not recovered:
-                print(f"  [!] page {page}: still empty after backoff — "
-                      f"skipping (snapshot kept); walk continues")
                 page += 1
                 time.sleep(SLEEP)
                 continue
+        consecutive_empty = 0
         for rec in rows:
             uid_count += rec["id_scheme"] == "safetykorea_uid"
             nk_count += rec["id_scheme"] == "natural_key"
-            rec["first_seen"] = store.get(rec["id"], {}).get("first_seen", today)
+            first_seen = store.get(rec["id"], {}).get("first_seen")
+            if rec["id_scheme"] == "safetykorea_uid" and rec["id"] not in store:
+                nk = (rec.get("date_published"), rec.get("product_name"),
+                      rec.get("model"), rec.get("company"))
+                old_id = nk_index.pop(nk, None)
+                if old_id and old_id in store:
+                    first_seen = store[old_id].get("first_seen")
+                    del store[old_id]          # nk record retires in place
+                    migrated += 1
+            rec["first_seen"] = first_seen or today
             rec["last_seen"] = today
             if rec["id"] in store:
                 refreshed += 1
@@ -151,7 +173,7 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     tmp.replace(OUT)
     print(f"[*] done: +{new} new, {refreshed} refreshed, "
-          f"anomalous_pages={anomalies}, store={len(store)}")
+          f"migrated_nk_to_uid={migrated}, store={len(store)}")
     print(f"[*] identity: safetykorea_uid={uid_count} natural_key={nk_count}")
     exp = int(total.group(1).replace(",", "")) if total else None
     if exp and len(store) < exp:
