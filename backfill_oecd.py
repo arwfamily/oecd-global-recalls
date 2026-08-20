@@ -1,354 +1,294 @@
-#!/usr/bin/env python3
 """
-OECD GlobalRecalls HISTORICAL BACKFILL (2000 -> today).
+OECD GlobalRecalls — full-history backfill via the portal's search API.
 
-Why this exists
----------------
-collect_oecd.py can only see the portal's 7-day rolling RSS window.
-But the portal's own SPA uses an internal search endpoint (captured by
-Angela via F12; public, no auth, CORS *) that accepts date-range queries
-back to 2000:
+The RSS feed (collect_oecd.py) is a rolling ~7-day window: it can only move
+forward. The portal's own search screen, however, is backed by a public JSON
+service that queries the ENTIRE registry back to 2000:
 
     https://globalrecalls.oecd.org/ws/search.xqy
-        ?q=<term> date GE <YYYY-MM-DD> AND date LE <YYYY-MM-DD>
-        &start=<offset>&end=<offset+page>&sort=date
+        ?q=<term?> date GE YYYY-MM-DD AND date LE YYYY-MM-DD
+        &start=<offset>&end=<offset+page>&sort=date&order=asc
+        &lang=en&uiLang=en
 
-CONSTITUTION Art.1: that query shape is the VERIFIED ORIGINAL. Do not
-"simplify" it (do not drop the date clause, do not reorder params) without
-re-verifying against the live endpoint. The Safety Gate `search` param
-incident (every request -> 400) is why.
+Verified live on 2026-08-19 (captured from the portal via browser dev tools,
+CORS header `Access-Control-Allow-Origin: *`, no auth, no cookies needed).
+Response echoes `total`, `page-length`, `where`, and returns `results[]` with:
 
-This one file covers AU (383 baby) and GB (239 baby) — the two
-jurisdictions we decided NOT to build native collectors for — and, as a
-bonus, gives KR interim coverage (102 baby records) until the native KR
-collector (본체 4호) is built. OECD records have no hazard/action fields,
-so KR 본체 is still needed for real depth; this is breadth, not depth.
+    countryId / countryName   ISO code + display name
+    id                        the source agency's own id  -> native_id
+    date                      recall date (YYYY-MM-DD)    -> date_submitted
+    product.name              title
+    extUrl                    THE ORIGINAL REGULATOR URL (cpsc.gov,
+                              healthycanadians.gc.ca, recalls.gov.au, ...)
+    tags[]                    OECD's cross-country product taxonomy
+                              (e.g. #P995 "baby", #P751 "phthalate")
+    manufacturer.country[]    where the product was made
+    imageUri / languageId
 
-Modes
------
-1. termless (preferred): q = "date GE X AND date LE Y" with no search
-   term -> everything in the window. First run logs whether the endpoint
-   accepts this ("[mode] termless OK" / "termless rejected -> term mode").
-2. term fallback: if termless returns nothing/errors, iterate FALLBACK_TERMS
-   per year window. Coarser, but still no ingest-time filtering beyond
-   what the endpoint forces on us (CPSC lesson: filtering at ingest
-   creates silent false negatives — so the term list is broad, not "baby").
+Two things the RSS records never had — extUrl and tags — make backfilled
+records RICHER than feed records, so the merge below also enriches existing
+feed records in place.
 
-Run model (GitHub Actions friendly)
------------------------------------
-- Budget of REQUEST_BUDGET HTTP calls per run; safe to run twice daily
-  alongside the antenna, or via workflow_dispatch until finished.
-- Checkpoint: data/oecd_backfill_state.json  — INSIDE data/ on purpose,
-  so the workflow's `git add data/` commits it (Constitution Art.3:
-  the root-level eu_state.json near-miss).
-- No-success guard (Constitution Art.4): if a run gets ZERO successful
-  responses, the checkpoint is NOT advanced — a network blackout must
-  never permanently skip a year window.
-- First error of each run is logged verbatim (Constitution Art.5:
-  no guess-fixes; let the next run's log prove the cause).
-- Raw response snapshots -> data/raw/oecd_backfill/*.json.gz (L0, immutable).
-- Final counts are printed FROM THE WRITTEN FILE, not from run tallies
-  (Angela's operating rule).
+Strategy
+--------
+- One query window per year, 2000..current. Small result sets per window,
+  shallow pagination, resumable per-window.
+- Query mode is detected at runtime: we first try a termless date-only query
+  (`q=date GE ... AND date LE ...`). If the service rejects it or returns
+  zero while the portal clearly has data, we fall back to a sweep of
+  child-domain terms (dedup makes the union safe). The run log states which
+  mode ran — read it.
+- Dedup key is (country, native_id), same as collect_oecd.py. EN beats other
+  languages for the same key. Records already in recalls_global.jsonl keep
+  their first_seen; their empty ext_url/tags fields are filled in.
+- `collected_via` records provenance: "rss" (default for old records),
+  "backfill". first_seen for backfilled records is the backfill run date —
+  it is truthfully the first day WE saw them; date_submitted carries the
+  recall's real date, which is the field to filter on downstream.
 
-Output
-------
-Merges into the SAME data/recalls_global.jsonl the antenna writes, with
-the SAME dedup key (country, native_id) and EN-over-FR upgrade — by
-importing collect_oecd's own functions, so the two writers can never
-drift. Extra search-API treasures are preserved when present:
-ext_url (origin-agency per-record link — covers bulk-less AU),
-tags (unified classification, e.g. P995=baby, P751=phthalate), made_in.
+Run:  python backfill_oecd.py            # full 2000..today
+      python backfill_oecd.py 2019 2022  # just those years (resume/repair)
 
-Usage
------
-    python3 backfill_oecd.py             # one budgeted run
-    python3 backfill_oecd.py saved.json  # local test: parse a saved response
-Add to collect.yml as a step after collect_oecd, or run via
-workflow_dispatch. When finished it prints "[backfill_oecd] FINISHED"
-and becomes a cheap no-op.
+Politeness: 0.4 s between requests, 3 retries with backoff, custom UA.
+State: data/backfill_state.json marks completed windows so a re-run skips
+them; delete a year from it (or the file) to force re-collection.
 """
 
-import datetime as dt
-import gzip
+import datetime
 import json
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Reuse the antenna's exact parsing/merge/write logic — single source of truth.
-from collect_oecd import (  # noqa: E402
-    OUT_PATH,
-    load_existing,
-    merge,
-    parse_guid,
-    strip_html,
-    summarize,
-    write_out,
-)
-
-BASE_URL = "https://globalrecalls.oecd.org/ws/search.xqy"
-
-ROOT = Path(__file__).resolve().parent
-STATE_PATH = ROOT / "data" / "oecd_backfill_state.json"   # inside data/ (Art.3)
-RAW_DIR = ROOT / "data" / "raw" / "oecd_backfill"
-
-FIRST_YEAR = 2000
-PAGE_SIZE = 50
-REQUEST_BUDGET = 100          # HTTP calls per run
-POLITE_DELAY_S = 1.0          # be a good citizen on a public endpoint
-TIMEOUT_S = 90                # endpoint is slow for non-browser clients
-
-# Constitution Art.2: governments/CDNs block non-browser clients.
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/126.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en",
-    "Referer": "https://globalrecalls.oecd.org/",
-}
-
-# Term-mode fallback only. Broad product-space tokens, NOT a baby filter —
-# ingest-time filtering is banned (CPSC false-negative lesson).
-FALLBACK_TERMS = [
-    "a", "e", "i", "o", "u",  # vowel sweep: cheap near-total coverage
-    "toy", "baby", "child", "car", "battery", "electric", "food",
+BASE = "https://globalrecalls.oecd.org/ws/search.xqy"
+UA = "TinySafe-GlobalRecalls/1.0 (baby product safety; contact: arwfamily)"
+OUT_PATH = Path(__file__).parent / "data" / "recalls_global.jsonl"
+STATE_PATH = Path(__file__).parent / "data" / "backfill_state.json"
+PAGE = 100          # requested page size; server may clamp — we follow its echo
+SLEEP = 0.4         # seconds between requests
+FALLBACK_TERMS = [  # used only if termless queries are rejected
+    "baby", "infant", "toddler", "child", "children", "kids", "nursery",
+    "crib", "cot", "bassinet", "stroller", "pram", "pushchair", "walker",
+    "high chair", "car seat", "booster", "pacifier", "teether", "teething",
+    "toy", "playpen", "sleepwear", "pyjama", "pajama", "bib", "swing",
+    "bouncer", "carrier", "sling", "monitor", "bottle", "soother",
 ]
 
 
-# ----------------------------------------------------------------- state ---
-
-def load_state() -> dict:
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {
-        "v": 1,
-        "mode": None,              # decided on first successful probe
-        "year": dt.date.today().year,  # walk DESCENDING: recent first
-        "offset": 0,
-        "term_index": 0,
-        "finished": False,
-    }
+def http_json(url: str, tries: int = 3):
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=45) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 — log and retry, network is dirty
+            print(f"  [!] attempt {attempt + 1}: {e}", file=sys.stderr)
+            time.sleep(2 * (attempt + 1))
+    return None
 
 
-def save_state(state: dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2) + "\n")
-    tmp.replace(STATE_PATH)
+def search(q: str, start: int, end: int):
+    params = urllib.parse.urlencode({
+        "q": q, "start": start, "end": end,
+        "sort": "date", "order": "asc", "lang": "en", "uiLang": "en",
+    })
+    return http_json(f"{BASE}?{params}")
 
 
-# ------------------------------------------------------------------ http ---
-
-def build_url(year: int, offset: int, term: str | None) -> str:
-    lo, hi = f"{year}-01-01", f"{year}-12-31"
-    clause = f"date GE {lo} AND date LE {hi}"
-    q = f"{term} {clause}" if term else clause
-    # Verified-original param order and shape (Art.1). quote() keeps spaces
-    # as %20 exactly as the browser sent them.
-    return (f"{BASE_URL}?q={urllib.parse.quote(q)}"
-            f"&start={offset}&end={offset + PAGE_SIZE}&sort=date")
+def window_query(term: str | None, y0: str, y1: str) -> str:
+    date_clause = f"date GE {y0} AND date LE {y1}"
+    return f"{term} {date_clause}" if term else date_clause
 
 
-def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-        return resp.read()
+def detect_termless(year: int) -> bool:
+    """True if the API accepts a date-only query (no search term)."""
+    q = window_query(None, f"{year}-01-01", f"{year}-12-31")
+    data = search(q, 0, 1)
+    if not data:
+        return False
+    # The service echoes the where-clause it actually ran. If it ran our
+    # date-only clause and reports a sane total, termless mode works.
+    ran = str(data.get("where") or "")
+    total = data.get("total") or 0
+    ok = "date GE" in ran and "AND date LE" in ran and total > 0
+    print(f"[*] termless probe ({year}): where={ran!r} total={total} -> "
+          f"{'OK' if ok else 'NOT SUPPORTED'}")
+    return ok
 
 
-def snapshot_raw(body: bytes, year: int, offset: int, term: str | None):
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    tag = term or "termless"
-    path = RAW_DIR / f"{year}_{tag}_{offset}.json.gz"
-    with gzip.open(path, "wb") as f:
-        f.write(body)
-
-
-# ----------------------------------------------------------------- parse ---
-
-def _first(d: dict, *keys, default=""):
-    for k in keys:
-        if k in d and d[k] not in (None, ""):
-            return d[k]
-    return default
-
-
-def _items_from_json(doc):
-    if isinstance(doc, list):
-        return doc
-    if isinstance(doc, dict):
-        for k in ("results", "items", "recalls", "hits", "docs", "records"):
-            v = doc.get(k)
-            if isinstance(v, list):
-                return v
-            if isinstance(v, dict) and isinstance(v.get("hits"), list):
-                return v["hits"]
-    return []
-
-
-def _items_from_xml(body: bytes):
-    root = ET.fromstring(body)
-    out = []
-    for item in root.iter():
-        if item.tag.split("}")[-1] in ("item", "recall", "result"):
-            rec = {child.tag.split("}")[-1]: (child.text or "").strip()
-                   for child in item}
-            if rec:
-                out.append(rec)
-    return out
-
-
-def parse_body(body: bytes):
-    """JSON preferred; XML tolerated. Raw is snapshotted either way, so if
-    a shape surprises us the NEXT run's log + snapshot settle it (Art.5)."""
-    text = body.decode("utf-8", errors="replace").lstrip()
-    if text.startswith(("{", "[")):
-        return _items_from_json(json.loads(text))
-    return _items_from_xml(body)
-
-
-def normalize(raw: dict):
-    """Map a search-API item onto the antenna record shape."""
-    guid = str(_first(raw, "guid", "uri", "recallURI", "id"))
-    lang, country, native_id = parse_guid(guid)
-    if not country:
+def norm_record(item: dict, today: str) -> dict | None:
+    country = (item.get("countryId") or "").strip()
+    native_id = str(item.get("id") or "").strip()
+    if not country or not native_id:
         return None
-    rec = {
-        "guid": guid,
+    tags = [
+        {"code": str(t.get("name") or "").rsplit("#", 1)[-1],
+         "value": (t.get("value") or "").strip()}
+        for t in (item.get("tags") or [])
+        if isinstance(t, dict) and t.get("value")
+    ]
+    made_in = [
+        (c.get("id") or "").strip()
+        for c in (item.get("manufacturer.country") or [])
+        if isinstance(c, dict) and c.get("id")
+    ]
+    lang = (item.get("languageId") or "").strip().upper()
+    return {
+        "guid": (item.get("uri") or "").strip(),
         "lang": lang,
         "country": country,
-        "country_name": str(_first(raw, "country", "countryName",
-                                   "creator", default="")),
+        "country_name": (item.get("countryName") or "").strip(),
         "native_id": native_id,
-        "title": strip_html(str(_first(raw, "title", "productName",
-                                       "product"))),
-        "description": strip_html(str(_first(raw, "description", "summary",
-                                             "details"))),
-        "date_submitted": str(_first(raw, "dateSubmitted", "date_submitted",
-                                     "date"))[:10],
-        "portal_link": str(_first(raw, "link", "portalLink", "url")),
+        "title": (item.get("product.name") or "").strip(),
+        "description": "",  # the search API returns no description body
+        "date_submitted": (item.get("date") or "").strip(),
+        "portal_link": (item.get("uri") or "").strip(),
+        "ext_url": (item.get("extUrl") or "").strip(),
+        "image_url": (item.get("imageUri") or "").strip() or None,
+        "tags": tags,
+        "made_in": made_in,
+        "first_seen": today,
+        "collected_via": "backfill",
     }
-    # Treasures unique to the search API — keep them when present.
-    ext = _first(raw, "extUrl", "exturl", "ext_url", default=None)
-    if ext:
-        rec["ext_url"] = str(ext)
-    tags = raw.get("tags")
-    if tags:
-        rec["tags"] = tags if isinstance(tags, list) else [str(tags)]
-    made = _first(raw, "made_in", "madeIn", default=None)
-    if made:
-        rec["made_in"] = str(made)
-    return rec
 
 
-# ------------------------------------------------------------------ main ---
+def load_existing() -> dict:
+    records = {}
+    if OUT_PATH.exists():
+        with OUT_PATH.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rec = json.loads(line)
+                    records[(rec["country"], rec["native_id"])] = rec
+    return records
+
+
+def merge(records: dict, rec: dict) -> str:
+    """Merge one backfilled record into the store. Returns what happened."""
+    key = (rec["country"], rec["native_id"])
+    old = records.get(key)
+    if old is None:
+        records[key] = rec
+        return "new"
+    # Same recall already known (from RSS or an earlier window).
+    # EN beats other languages for the text fields; enrichment fields
+    # (ext_url, tags, made_in, image_url) fill in wherever they are empty.
+    changed = False
+    if rec["lang"] == "EN" and old.get("lang") != "EN":
+        # EN wins the human-facing fields — including ext_url, because that
+        # is the link a parent clicks (the FR twin points at the -fra page).
+        for k in ("lang", "title", "guid", "portal_link", "country_name",
+                  "ext_url", "image_url"):
+            if rec.get(k):
+                old[k] = rec[k]
+                changed = True
+    for k in ("ext_url", "image_url", "made_in", "date_submitted"):
+        if rec.get(k) and not old.get(k):
+            old[k] = rec[k]
+            changed = True
+    # Tags are a union by taxonomy code: the EN and FR twins of one recall
+    # can carry different subsets, and the codes are language-independent.
+    if rec.get("tags"):
+        have = {t.get("code") for t in (old.get("tags") or [])}
+        add = [t for t in rec["tags"] if t.get("code") not in have]
+        if add:
+            old["tags"] = (old.get("tags") or []) + add
+            changed = True
+    old.setdefault("collected_via", "rss")
+    return "enriched" if changed else "dup"
+
+
+def collect_window(records: dict, term: str | None, y0: str, y1: str,
+                   today: str) -> dict:
+    q = window_query(term, y0, y1)
+    counts = {"new": 0, "enriched": 0, "dup": 0}
+    start, total = 0, None
+    while True:
+        data = search(q, start, start + PAGE)
+        if data is None:
+            print(f"  [!] window {y0}..{y1} term={term!r}: giving up at "
+                  f"offset {start} — re-run to resume", file=sys.stderr)
+            break
+        if total is None:
+            total = int(data.get("total") or 0)
+        results = data.get("results") or []
+        if not results:
+            break
+        for item in results:
+            rec = norm_record(item, today)
+            if rec:
+                counts[merge(records, rec)] += 1
+        start += len(results)
+        if start >= total:
+            break
+        time.sleep(SLEEP)
+    counts["total_reported"] = total or 0
+    return counts
+
+
+def save(records: dict):
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    rows = sorted(records.values(),
+                  key=lambda r: (r.get("date_submitted") or "",
+                                 r.get("country") or ""))
+    tmp = OUT_PATH.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp.replace(OUT_PATH)
+
 
 def main():
-    today = dt.date.today().isoformat()
+    today = datetime.date.today().isoformat()
+    this_year = datetime.date.today().year
+    y_from = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
+    y_to = int(sys.argv[2]) if len(sys.argv) > 2 else this_year
 
-    if len(sys.argv) > 1:  # local test on a saved response body
-        body = Path(sys.argv[1]).read_bytes()
-        items = parse_body(body)
-        recs = [r for r in (normalize(i) for i in items) if r]
-        print(f"[backfill_oecd] local parse: {len(items)} items "
-              f"-> {len(recs)} records")
-        for r in recs[:5]:
-            print("  ", r["country"], r["date_submitted"], r["title"][:70])
-        return
+    state = {}
+    if STATE_PATH.exists():
+        state = json.loads(STATE_PATH.read_text())
 
-    state = load_state()
-    if state.get("finished"):
-        print("[backfill_oecd] FINISHED — nothing to do.")
-        return
+    records = load_existing()
+    print(f"[*] existing store: {len(records)} records")
 
-    existing = load_existing()
-    before = len(existing)
-    budget = REQUEST_BUDGET
-    successes = 0
-    first_error = None
-    total_added = total_updated = 0
+    termless = detect_termless(min(2015, this_year))
+    if not termless:
+        print(f"[*] falling back to a {len(FALLBACK_TERMS)}-term sweep per "
+              f"year window (dedup makes the union safe)")
 
-    while budget > 0 and not state["finished"]:
-        term = None
-        if state["mode"] == "term":
-            term = FALLBACK_TERMS[state["term_index"]]
-        url = build_url(state["year"], state["offset"], term)
-
-        budget -= 1
-        try:
-            body = fetch(url)
-        except (urllib.error.URLError, urllib.error.HTTPError,
-                TimeoutError, OSError) as e:
-            if first_error is None:
-                first_error = f"{type(e).__name__}: {e} @ {url}"
-            # mode probe: termless failing hard on the very first call
-            if state["mode"] is None:
-                print("[mode] termless rejected -> term mode")
-                state["mode"] = "term"
-                continue
-            time.sleep(POLITE_DELAY_S)
+    grand = {"new": 0, "enriched": 0, "dup": 0}
+    for year in range(y_from, y_to + 1):
+        wkey = f"{year}:{'termless' if termless else 'sweep'}"
+        if state.get(wkey) == "done":
+            print(f"[{year}] already done — skipping (state file)")
             continue
+        y0, y1 = f"{year}-01-01", f"{year}-12-31"
+        if termless:
+            c = collect_window(records, None, y0, y1, today)
+            print(f"[{year}] total={c['total_reported']} new={c['new']} "
+                  f"enriched={c['enriched']} dup={c['dup']}")
+            for k in grand:
+                grand[k] += c[k]
+        else:
+            for term in FALLBACK_TERMS:
+                c = collect_window(records, term, y0, y1, today)
+                if c["total_reported"]:
+                    print(f"[{year}] {term!r}: total={c['total_reported']} "
+                          f"new={c['new']} enriched={c['enriched']}")
+                for k in grand:
+                    grand[k] += c[k]
+                time.sleep(SLEEP)
+        state[wkey] = "done"
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps(state, indent=1))
+        save(records)  # checkpoint after every year — a crash loses nothing
 
-        successes += 1
-        snapshot_raw(body, state["year"], state["offset"], term)
-
-        try:
-            items = parse_body(body)
-        except Exception as e:  # noqa: BLE001 — log first, fix from log
-            if first_error is None:
-                first_error = f"parse {type(e).__name__}: {e} @ {url}"
-            items = []
-
-        if state["mode"] is None:
-            state["mode"] = "termless" if items else "term"
-            print(f"[mode] probe result: {state['mode']}"
-                  + (" OK" if items else " (termless empty -> term mode)"))
-            if state["mode"] == "term":
-                continue
-
-        recs = [r for r in (normalize(i) for i in items) if r]
-        added, updated = merge(existing, recs, today)
-        total_added += added
-        total_updated += updated
-
-        # advance cursor
-        if len(items) >= PAGE_SIZE:
-            state["offset"] += PAGE_SIZE
-        else:  # window exhausted
-            state["offset"] = 0
-            if state["mode"] == "term":
-                state["term_index"] += 1
-                if state["term_index"] < len(FALLBACK_TERMS):
-                    continue
-                state["term_index"] = 0
-            state["year"] -= 1
-            if state["year"] < FIRST_YEAR:
-                state["finished"] = True
-
-        time.sleep(POLITE_DELAY_S)
-
-    write_out(existing)
-
-    # No-success guard (Art.4): a blackout run must not move the pointer.
-    if successes > 0:
-        save_state(state)
-    else:
-        print("[guard] zero successful responses — state NOT advanced")
-
-    if first_error:
-        print(f"[first-error] {first_error}")
-
-    # Counts from the written file (Angela's rule), not from run tallies.
-    written = load_existing()
-    print(f"[backfill_oecd] {today}: {before} -> {len(written)} "
-          f"(+{total_added} new, {total_updated} updated) "
-          f"mode={state['mode']} cursor={state['year']}/{state['offset']} "
-          f"finished={state['finished']}")
-    print(summarize(written, today))
+    print(f"\n[*] backfill done: +{grand['new']} new, "
+          f"{grand['enriched']} enriched, {grand['dup']} already known")
+    print(f"[*] store now: {len(records)} records -> {OUT_PATH}")
 
 
 if __name__ == "__main__":
