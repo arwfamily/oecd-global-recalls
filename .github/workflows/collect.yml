@@ -38,6 +38,12 @@ jobs:
         # resuming from eu_state.json every run.
         run: python collect_eu.py
 
+      - name: Run KR collector
+        # Seoul mirror of safetykorea (제품안전정보센터) — zero-auth GET
+        # pagination, ~124 pages, walks the full 3-year window every run;
+        # the canonical store only grows, so history accrues from today.
+        run: python collect_kr_seoul.py
+
       - name: Commit results
         run: |
           git config user.name "oecd-collector-bot"
